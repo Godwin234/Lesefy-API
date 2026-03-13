@@ -11,6 +11,7 @@ pymongo = "*"
 pyjwt = "*"
 flask-caching = "*"
 redis = "*"
+flask-socketio = "*"
 
 [dev-packages]
 

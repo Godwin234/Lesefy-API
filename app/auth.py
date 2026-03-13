@@ -8,6 +8,24 @@ from .cache import cache
 auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
 
+def decode_token(request):
+    """
+    Decode the Bearer JWT from the Authorization header.
+    Returns (user_id_str, None) on success or (None, error_response_tuple) on failure.
+    """
+    auth_header = request.headers.get("Authorization", "")
+    if not auth_header.startswith("Bearer "):
+        return None, (jsonify({"success": False, "message": "Authorization token required"}), 401)
+    token = auth_header.split(" ", 1)[1]
+    try:
+        payload = jwt.decode(token, current_app.config["SECRET_KEY"], algorithms=["HS256"])
+        return payload["sub"], None
+    except jwt.ExpiredSignatureError:
+        return None, (jsonify({"success": False, "message": "Token has expired"}), 401)
+    except jwt.InvalidTokenError:
+        return None, (jsonify({"success": False, "message": "Invalid token"}), 401)
+
+
 @cache.memoize(timeout=300)
 def _get_user_by_email(email):
     """Cached user lookup by email. Returns user dict with _id as str."""
@@ -28,8 +46,8 @@ def register():
     dob_raw = data.get("dateOfBirth") or data.get("dob") or ""
 
     # Required field check
-    if not email or not password:
-        return jsonify({"success": False, "message": "Email and password are required"}), 400
+    if not email:
+        return jsonify({"success": False, "message": "Email is required"}), 400
 
     db = current_app.db
 
@@ -58,14 +76,27 @@ def register():
     if phone:
         user_doc["phone"] = phone
 
+    # If a valid Bearer token is present, set createdBy to that user's ID.
+    # This takes precedence over any createdBy value sent in the request body.
+    token_user_id, _ = decode_token(request)
+    if token_user_id:
+        user_doc["createdBy"] = ObjectId(token_user_id)
+    elif user_doc.get("createdBy"):
+        # No token, but a createdBy was explicitly sent — coerce it to ObjectId
+        try:
+            user_doc["createdBy"] = ObjectId(str(user_doc["createdBy"]))
+        except Exception:
+            return jsonify({"success": False, "message": "Invalid createdBy value"}), 400
+
     result = db.user.insert_one(user_doc)
     user_id = result.inserted_id
 
-    # Store hashed password in the separate password collection
-    db.password.insert_one({
-        "user_id": user_id,
-        "password_hash": generate_password_hash(password),
-    })
+    # Store hashed password only if one was provided
+    if password:
+        db.password.insert_one({
+            "user_id": user_id,
+            "password_hash": generate_password_hash(password),
+        })
 
     return jsonify({
         "success": True,
@@ -79,6 +110,37 @@ def register():
     }), 201
 
 
+@auth_bp.route("/tenants", methods=["GET"])
+def list_tenants():
+    """
+    Return all users with userType 'tenant' that were created by the
+    authenticated landlord (matched via the createdBy field).
+
+    Requires: Bearer token.
+
+    GET /api/auth/tenants
+    """
+    landlord_id, err = decode_token(request)
+    if err:
+        return err
+
+    tenants = list(
+        current_app.db.user.find(
+            {"createdBy": ObjectId(landlord_id)}
+        )
+    )
+
+    for t in tenants:
+        t["_id"] = str(t["_id"])
+        if "createdBy" in t:
+            t["createdBy"] = str(t["createdBy"])
+        if "propertyId" in t:
+            t["propertyId"] = str(t["propertyId"])
+    print(f"Found {len(tenants)} tenants for landlord {landlord_id}")
+
+    return jsonify({"success": True, "data": tenants}), 200
+
+
 @auth_bp.route("/login", methods=["POST"])
 def login():
     data = request.get_json(silent=True) or {}
@@ -86,8 +148,8 @@ def login():
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
 
-    if not email or not password:
-        return jsonify({"success": False, "message": "Email and password are required"}), 400
+    if not email:
+        return jsonify({"success": False, "message": "Email is required"}), 400
 
     db = current_app.db
 
@@ -99,14 +161,22 @@ def login():
     # Look up the password record linked to this user (not cached — security sensitive)
     password_record = db.password.find_one({"user_id": ObjectId(user["_id"])})
     if not password_record:
-        return jsonify({"success": False, "message": "Invalid email or password"}), 401
+        return jsonify({"success": False, "message": "No password found"}), 401
+
+    if not password:
+        return jsonify({"success": False, "message": "Password is required"}), 400
 
     # Verify the submitted password against the stored hash
     if not check_password_hash(password_record["password_hash"], password):
         return jsonify({"success": False, "message": "Invalid email or password"}), 401
 
-    # Build user object (all fields except internal MongoDB _id)
-    user_data = {k: v for k, v in user.items() if k != "_id"}
+    # Build user object (all fields except internal MongoDB _id),
+    # converting any ObjectId values to strings so they are JSON-serialisable.
+    user_data = {
+        k: str(v) if isinstance(v, ObjectId) else v
+        for k, v in user.items()
+        if k != "_id"
+    }
 
     # Generate JWT token
     payload = {

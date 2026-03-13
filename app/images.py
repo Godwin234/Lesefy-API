@@ -12,6 +12,7 @@ PICTURE_TYPES = {
     "MoveOutPictures",
     "RecieptPictures",
     "ListingPictures",
+    "MaintenancePictures",
 }
 
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp", "heic"}
