@@ -54,6 +54,9 @@ def create_app():
     from .chat import chat_bp, ensure_indexes
     app.register_blueprint(chat_bp)
 
+    from .notifications import notifications_bp, ensure_notification_indexes
+    app.register_blueprint(notifications_bp)
+
     # ── Flask-SocketIO ────────────────────────────────────────────────────────
     from .socket import socketio
     socketio.init_app(
@@ -72,5 +75,6 @@ def create_app():
     # Ensure MongoDB indexes exist for the chat collections
     with app.app_context():
         ensure_indexes(app.db)
+        ensure_notification_indexes(app.db)
 
     return app

@@ -43,13 +43,101 @@ def _parse_oid(value):
         return None
 
 
-def _fmt_message(msg):
+def _is_email(value):
+    """Return True if value looks like an email address."""
+    at = value.find("@")
+    return at > 0 and "." in value[at + 1:]
+
+
+def _resolve_recipient(value, db):
+    """
+    Resolve a recipientId string to a user document.
+
+    Resolution order
+    ────────────────
+    1. If value contains '@' → look up user by email.
+    2. Otherwise treat as ObjectId:
+       a. Search user collection first.
+       b. If not found, search property collection and follow landlordId.
+
+    Returns (user_doc, error_message).  Exactly one of the two will be None.
+    """
+    if _is_email(value):
+        user = db.user.find_one({"email": value.lower().strip()})
+        if not user:
+            return None, f"No user found with email '{value}'"
+        return user, None
+
+    oid = _parse_oid(value)
+    if not oid:
+        return None, "Invalid recipientId: must be a valid email address or ObjectId"
+
+    # Try the user collection first
+    user = db.user.find_one({"_id": oid})
+    if user:
+        return user, None
+
+    # Fall back to property collection → landlord
+    prop = db.property.find_one({"_id": oid})
+    if prop:
+        landlord_id = prop.get("landlordId")
+        if not landlord_id:
+            return None, "The property has no landlord assigned"
+        landlord = db.user.find_one({"_id": landlord_id})
+        if not landlord:
+            return None, "The property's landlord account was not found"
+        return landlord, None
+
+    return None, "No user or property found with the given ID"
+
+
+def _auto_detect_recipient(sender_doc, db):
+    """
+    For a tenant user, find their landlord via the linked property.
+    Returns a user doc or None.
+    """
+    prop_id = sender_doc.get("propertyId")
+    if not prop_id:
+        return None
+    prop = db.property.find_one({"_id": prop_id})
+    if not prop or not prop.get("landlordId"):
+        return None
+    return db.user.find_one({"_id": prop["landlordId"]})
+
+
+def _user_info(oid, db):
+    """Return a lightweight dict {email, name} for a user ObjectId."""
+    if not oid or db is None:
+        return {"email": None, "name": None}
+    u = db.user.find_one(
+        {"_id": oid},
+        {"email": 1, "firstName": 1, "lastName": 1},
+    )
+    if not u:
+        return {"email": None, "name": None}
+    name = f"{u.get('firstName', '')} {u.get('lastName', '')}".strip() or None
+    return {"email": u.get("email"), "name": name}
+
+
+def _fmt_message(msg, db=None):
+    sender_info = _user_info(msg.get("senderId"), db)
+
+    read_by_emails = []
+    if db is not None:
+        for uid in msg.get("readBy", []):
+            info = _user_info(uid, db)
+            if info["email"]:
+                read_by_emails.append(info["email"])
+    else:
+        read_by_emails = [str(uid) for uid in msg.get("readBy", [])]
+
     return {
         "id": str(msg["_id"]),
         "conversationId": str(msg["conversationId"]),
-        "senderId": str(msg["senderId"]),
-        "text": msg["text"],
-        "readBy": [str(uid) for uid in msg.get("readBy", [])],
+        "senderId": sender_info["email"] or str(msg["senderId"]),
+        "senderName": sender_info["name"],
+        "text": msg.get("text") or msg.get("content") or "",
+        "readBy": read_by_emails,
         "createdAt": msg["createdAt"].isoformat(),
     }
 
@@ -58,6 +146,7 @@ def _fmt_conversation(conv, current_uid_str=None, db=None):
     data = {
         "id": str(conv["_id"]),
         "participants": [str(p) for p in conv["participants"]],
+        "participantEmails": conv.get("participantEmails") or [],
         "propertyId": str(conv["propertyId"]) if conv.get("propertyId") else None,
         "lastMessage": conv.get("lastMessage"),
         "updatedAt": conv["updatedAt"].isoformat(),
@@ -84,10 +173,13 @@ def can_chat(sender_doc, recipient_doc, db):
     property_manager → tenants of a property they manage  OR  contractors
     contractor       → any landlord or property_manager
     """
-    sender_role    = (sender_doc.get("role") or "tenant").lower()
-    recipient_role = (recipient_doc.get("role") or "tenant").lower()
+    sender_role    = (sender_doc.get("userType") or "").lower()
+    recipient_role = (recipient_doc.get("userType") or "").lower()
     sender_id      = sender_doc["_id"]
     recipient_id   = recipient_doc["_id"]
+
+    if not sender_role:
+        return False, "Sender account has no userType configured"
 
     # ── tenant ────────────────────────────────────────────────────────────────
     if sender_role == "tenant":
@@ -114,17 +206,29 @@ def can_chat(sender_doc, recipient_doc, db):
 
         # Allow messaging tenants who belong to a property they control
         if recipient_role == "tenant":
+            # Primary check: use the tenant's propertyId field
             rec_prop_id = recipient_doc.get("propertyId")
-            if not rec_prop_id:
-                return False, "That user is not linked to any property"
+            if rec_prop_id:
+                if sender_role == "landlord":
+                    prop = db.property.find_one(
+                        {"_id": rec_prop_id, "landlordId": sender_id}
+                    )
+                else:  # property_manager
+                    prop = db.property.find_one(
+                        {"_id": rec_prop_id, "propertyManagerId": sender_id}
+                    )
+                if prop:
+                    return True, None
 
+            # Fallback: check the property's tenants array directly (handles
+            # cases where the tenant's propertyId field is not yet synced)
             if sender_role == "landlord":
                 prop = db.property.find_one(
-                    {"_id": rec_prop_id, "landlordId": sender_id}
+                    {"landlordId": sender_id, "tenants.tenantId": recipient_id}
                 )
             else:  # property_manager
                 prop = db.property.find_one(
-                    {"_id": rec_prop_id, "propertyManagerId": sender_id}
+                    {"propertyManagerId": sender_id, "tenants.tenantId": recipient_id}
                 )
             if not prop:
                 return False, "You can only message tenants within properties you manage"
@@ -143,19 +247,44 @@ def can_chat(sender_doc, recipient_doc, db):
 
 # ── Shared conversation helper (also used by socket_events) ──────────────────
 
-def get_or_create_conversation(sender_oid, recipient_oid, db, property_id=None):
+def get_or_create_conversation(sender_doc, recipient_doc, db, property_id=None):
     """
     Return (conv_doc, created: bool) for the 1-on-1 thread between two users.
-    Participants are stored sorted so the lookup is always deterministic.
+
+    Primary lookup key: sorted pair of participant emails (deterministic and
+    stable even if ObjectIds change).  Falls back to the sorted ObjectId pair
+    for backward-compatibility with pre-existing documents.
     """
+    sender_oid    = sender_doc["_id"]
+    recipient_oid = recipient_doc["_id"]
+    sender_email    = (sender_doc.get("email") or "").lower().strip()
+    recipient_email = (recipient_doc.get("email") or "").lower().strip()
+    email_pair = sorted([sender_email, recipient_email]) if sender_email and recipient_email else None
+
+    # 1. Lookup by email pair (preferred)
+    if email_pair:
+        conv = db.conversation.find_one({"participantEmails": email_pair})
+        if conv:
+            return conv, False
+
+    # 2. Fallback lookup by ObjectId pair (backward compat)
     pair = sorted([sender_oid, recipient_oid], key=lambda x: str(x))
     conv = db.conversation.find_one({"participants": {"$all": pair, "$size": 2}})
     if conv:
+        # Migrate: backfill participantEmails if missing
+        if email_pair and not conv.get("participantEmails"):
+            db.conversation.update_one(
+                {"_id": conv["_id"]},
+                {"$set": {"participantEmails": email_pair}},
+            )
+            conv["participantEmails"] = email_pair
         return conv, False
 
+    # 3. Create a new conversation
     now = _now()
     doc = {
         "participants": pair,
+        "participantEmails": email_pair or [],
         "propertyId": property_id,
         "lastMessage": None,
         "createdAt": now,
@@ -168,8 +297,9 @@ def get_or_create_conversation(sender_oid, recipient_oid, db, property_id=None):
 
 def ensure_indexes(db):
     """Create MongoDB indexes for the chat collections (idempotent)."""
-    # Conversation: fast participant-pair lookup
+    # Conversation: fast participant-pair and email-pair lookups
     db.conversation.create_index("participants")
+    db.conversation.create_index("participantEmails")
     db.conversation.create_index([("updatedAt", -1)])
     # Message: paginated history and unread counts
     db.message.create_index([("conversationId", 1), ("createdAt", -1)])
@@ -183,10 +313,11 @@ def start_conversation():
     """
     Start or retrieve a 1-on-1 conversation with another user.
 
-    Permission is validated before a conversation is created.
-
     JSON body:
-      - recipientId  (string, required)
+      - recipientId  (string, optional) — email address, user ObjectId, or
+                     property ObjectId (the property's landlord is used).
+                     May be omitted for tenants: the landlord of their linked
+                     property is detected automatically.
       - propertyId   (string, optional) — contextual property reference
 
     Returns the conversation document (201 if new, 200 if existing).
@@ -195,40 +326,54 @@ def start_conversation():
     if err:
         return err
 
-    data = request.get_json(silent=True) or {}
-    recipient_id_str = (data.get("recipientId") or "").strip()
-    if not recipient_id_str:
-        return jsonify({"success": False, "message": "recipientId is required"}), 400
+    db        = current_app.db
+    sender_oid = _parse_oid(sender_id_str)
+    sender_doc = db.user.find_one({"_id": sender_oid})
+    if not sender_doc:
+        return jsonify({"success": False, "message": "Sender account not found"}), 404
 
-    sender_oid    = _parse_oid(sender_id_str)
-    recipient_oid = _parse_oid(recipient_id_str)
-    if not recipient_oid:
-        return jsonify({"success": False, "message": "Invalid recipientId"}), 400
-    if sender_oid == recipient_oid:
+    data          = request.get_json(silent=True) or {}
+    recipient_raw = (data.get("recipientId") or "").strip()
+
+    if not recipient_raw:
+        # Auto-detect: only supported for tenants
+        if (sender_doc.get("userType") or "").lower() != "tenant":
+            return jsonify({"success": False, "message": "recipientId is required"}), 400
+        recipient_doc = _auto_detect_recipient(sender_doc, db)
+        if not recipient_doc:
+            return jsonify({
+                "success": False,
+                "message": "Could not auto-detect a landlord for this tenant — ensure the tenant is linked to a property",
+            }), 404
+    else:
+        recipient_doc, resolve_err = _resolve_recipient(recipient_raw, db)
+        if not recipient_doc:
+            return jsonify({"success": False, "message": resolve_err}), 404
+
+    if sender_doc["_id"] == recipient_doc["_id"]:
         return jsonify({"success": False, "message": "Cannot start a conversation with yourself"}), 400
-
-    db            = current_app.db
-    sender_doc    = db.user.find_one({"_id": sender_oid})
-    recipient_doc = db.user.find_one({"_id": recipient_oid})
-
-    if not sender_doc or not recipient_doc:
-        return jsonify({"success": False, "message": "User not found"}), 404
 
     allowed, reason = can_chat(sender_doc, recipient_doc, db)
     if not allowed:
         # A conversation may already exist — allow retrieval even if the
         # direction check currently fails (e.g. roles changed after creation).
-        pair = sorted([sender_oid, recipient_oid], key=lambda x: str(x))
-        existing = db.conversation.find_one(
-            {"participants": {"$all": pair, "$size": 2}}
-        )
+        existing = None
+        s_email = (sender_doc.get("email") or "").lower().strip()
+        r_email = (recipient_doc.get("email") or "").lower().strip()
+        if s_email and r_email:
+            existing = db.conversation.find_one(
+                {"participantEmails": sorted([s_email, r_email])}
+            )
+        if not existing:
+            pair = sorted([sender_doc["_id"], recipient_doc["_id"]], key=lambda x: str(x))
+            existing = db.conversation.find_one(
+                {"participants": {"$all": pair, "$size": 2}}
+            )
         if not existing:
             return jsonify({"success": False, "message": reason}), 403
 
     prop_oid = _parse_oid(data.get("propertyId") or "")
-    conv, created = get_or_create_conversation(
-        sender_oid, recipient_oid, db, prop_oid
-    )
+    conv, created = get_or_create_conversation(sender_doc, recipient_doc, db, prop_oid)
     return (
         jsonify({"success": True, "data": _fmt_conversation(conv, sender_id_str, db)}),
         201 if created else 200,
@@ -260,18 +405,101 @@ def list_conversations():
         if other_ids:
             other = db.user.find_one(
                 {"_id": other_ids[0]},
-                {"firstName": 1, "lastName": 1, "role": 1, "profilePicture": 1},
+                {"firstName": 1, "lastName": 1, "userType": 1, "profilePicture": 1},
             )
             if other:
                 fmt["recipient"] = {
                     "id": str(other["_id"]),
                     "name": f"{other.get('firstName', '')} {other.get('lastName', '')}".strip(),
-                    "role": other.get("role", "tenant"),
+                    "role": other.get("userType", ""),
                     "profilePicture": other.get("profilePicture"),
                 }
         result.append(fmt)
 
     return jsonify({"success": True, "data": result}), 200
+
+
+@chat_bp.route("/conversations/<conv_id>/messages", methods=["POST"])
+def send_message(conv_id):
+    """
+    Send a message to a conversation via HTTP.
+
+    JSON body:
+      - text  (string, required) — message content
+
+    Returns the created message document (201).
+    Also updates conversation.lastMessage and broadcasts via SocketIO
+    if connected clients are present.
+    """
+    user_id_str, err = decode_token(request)
+    if err:
+        return err
+
+    user_oid = _parse_oid(user_id_str)
+    conv_oid = _parse_oid(conv_id)
+    if not conv_oid:
+        return jsonify({"success": False, "message": "Invalid conversation ID"}), 400
+
+    db   = current_app.db
+    conv = db.conversation.find_one({"_id": conv_oid, "participants": user_oid})
+    if not conv:
+        return jsonify({"success": False, "message": "Conversation not found"}), 404
+
+    data = request.get_json(silent=True) or {}
+    text = (data.get("content") or data.get("text") or "").strip()
+    if not text:
+        return jsonify({"success": False, "message": "content is required"}), 400
+    if len(text) > 4000:
+        return jsonify({"success": False, "message": "Message must not exceed 4000 characters"}), 400
+
+    now = _now()
+    msg_doc = {
+        "conversationId": conv_oid,
+        "senderId":       user_oid,
+        "text":           text,
+        "readBy":         [user_oid],
+        "createdAt":      now,
+    }
+    result = db.message.insert_one(msg_doc)
+    msg_doc["_id"] = result.inserted_id
+
+    db.conversation.update_one(
+        {"_id": conv_oid},
+        {"$set": {
+            "lastMessage": {
+                "text":      text[:120],
+                "senderId":  user_id_str,
+                "createdAt": now.isoformat(),
+            },
+            "updatedAt": now,
+        }},
+    )
+
+    payload = _fmt_message(msg_doc, db)
+
+    # Broadcast via SocketIO so connected clients receive it in real time
+    try:
+        from .socket import socketio
+        socketio.emit("new_message", payload, to=conv_id)
+        for participant_oid in conv["participants"]:
+            p_str = str(participant_oid)
+            if p_str != user_id_str:
+                socketio.emit("new_message", payload, to=p_str)
+    except Exception:
+        pass  # SocketIO not available; HTTP response is still returned
+
+    # Push notifications to all recipients
+    try:
+        from .notifications import trigger_message_notification
+        sender_doc = db.user.find_one({"_id": user_oid})
+        recipient_oids = [p for p in conv["participants"] if p != user_oid]
+        trigger_message_notification(
+            sender_doc, recipient_oids, conv_id, text, current_app._get_current_object()
+        )
+    except Exception:
+        pass
+
+    return jsonify({"success": True, "data": payload}), 201
 
 
 @chat_bp.route("/conversations/<conv_id>/messages", methods=["GET"])
@@ -318,7 +546,7 @@ def get_messages(conv_id):
     total = db.message.count_documents({"conversationId": conv_oid})
     return jsonify({
         "success": True,
-        "data": [_fmt_message(m) for m in messages],
+        "data": [_fmt_message(m, db) for m in messages],
         "pagination": {
             "page": page,
             "limit": limit,

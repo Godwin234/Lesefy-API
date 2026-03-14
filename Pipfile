@@ -12,6 +12,7 @@ pyjwt = "*"
 flask-caching = "*"
 redis = "*"
 flask-socketio = "*"
+firebase-admin = "*"
 
 [dev-packages]
 

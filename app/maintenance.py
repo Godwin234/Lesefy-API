@@ -10,7 +10,7 @@ from .auth import decode_token
 maintenance_bp = Blueprint("maintenance", __name__, url_prefix="/api/maintenance")
 
 ALLOWED_EXTENSIONS = {"jpg", "jpeg", "png", "gif", "webp", "heic"}
-ALLOWED_STATUSES = {"open", "in_progress", "resolved", "closed"}
+ALLOWED_STATUSES = {"pending", "in_progress", "resolved", "closed"}
 ALLOWED_PRIORITIES = {"low", "medium", "high", "urgent"}
 MAX_PICTURES = 10
 
@@ -136,7 +136,7 @@ def create_request():
         "title": title,
         "description": description,
         "priority": priority,
-        "status": "Open",
+        "status": "pending",
         "pictures": [],
         "assignedTo": None,
         "notes": [],

@@ -187,10 +187,10 @@ def on_send_message(data):
         return
 
     conv_id = (data or {}).get("conversationId", "")
-    text    = (data or {}).get("text", "").strip()
+    text    = ((data or {}).get("content") or (data or {}).get("text") or "").strip()
 
     if not conv_id or not text:
-        emit("error", {"message": "conversationId and text are required"})
+        emit("error", {"message": "conversationId and content are required"})
         return
 
     if len(text) > 4000:
@@ -233,7 +233,7 @@ def on_send_message(data):
     )
 
     from .chat import _fmt_message
-    payload = _fmt_message(msg_doc)
+    payload = _fmt_message(msg_doc, current_app.db)
 
     # Broadcast to everyone in the conversation room
     emit("new_message", payload, to=conv_id)
@@ -243,6 +243,17 @@ def on_send_message(data):
         p_str = str(participant_oid)
         if p_str != uid:
             socketio.emit("new_message", payload, to=p_str)
+
+    # Push notifications to offline / background recipients
+    try:
+        from .notifications import trigger_message_notification
+        sender_doc = db.user.find_one({"_id": user_oid})
+        recipient_oids = [p for p in conv["participants"] if p != user_oid]
+        trigger_message_notification(
+            sender_doc, recipient_oids, conv_id, text, current_app._get_current_object()
+        )
+    except Exception:
+        pass
 
 
 # ── Typing indicators ─────────────────────────────────────────────────────────
