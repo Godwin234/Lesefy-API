@@ -57,6 +57,24 @@ def create_app():
     from .notifications import notifications_bp, ensure_notification_indexes
     app.register_blueprint(notifications_bp)
 
+    from .documents import documents_bp, ensure_document_indexes
+    app.register_blueprint(documents_bp)
+
+    from .receipts import receipts_bp, ensure_receipt_indexes
+    app.register_blueprint(receipts_bp)
+
+    from .transactions import transactions_bp, ensure_transaction_indexes
+    app.register_blueprint(transactions_bp)
+
+    from .background_checks import background_checks_bp, ensure_background_check_indexes
+    app.register_blueprint(background_checks_bp)
+
+    from .stripe_finance import stripe_bp, ensure_stripe_indexes
+    app.register_blueprint(stripe_bp)
+
+    from .rent import rent_bp, ensure_rent_indexes
+    app.register_blueprint(rent_bp)
+
     # ── Flask-SocketIO ────────────────────────────────────────────────────────
     from .socket import socketio
     socketio.init_app(
@@ -76,5 +94,11 @@ def create_app():
     with app.app_context():
         ensure_indexes(app.db)
         ensure_notification_indexes(app.db)
+        ensure_document_indexes(app.db)
+        ensure_receipt_indexes(app.db)
+        ensure_transaction_indexes(app.db)
+        ensure_background_check_indexes(app.db)
+        ensure_stripe_indexes(app.db)
+        ensure_rent_indexes(app.db)
 
     return app

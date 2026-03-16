@@ -13,6 +13,10 @@ flask-caching = "*"
 redis = "*"
 flask-socketio = "*"
 firebase-admin = "*"
+pymupdf = "*"
+pillow = "*"
+easyocr = "*"
+stripe = "*"
 
 [dev-packages]
 
