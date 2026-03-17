@@ -396,7 +396,7 @@ def current_lease():
             "signers": {
                 "$elemMatch": {
                     "userId": user_oid,
-                    "status": "completed",
+                    "status": {"$in": ["completed", "signed"]},
                 }
             },
         },
