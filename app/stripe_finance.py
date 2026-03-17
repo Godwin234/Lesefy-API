@@ -737,6 +737,67 @@ def detach_payment_method(payment_method_id):
 # Webhook helpers
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _trigger_tenant_payment_confirmation(
+    tenant_oid, amount, currency, period,
+    rent_status, property_address, rent_id, property_id, db, app
+):
+    """
+    Send a payment-confirmation notification to the tenant after a successful
+    Stripe charge:  "Your payment was received."
+    """
+    from .notifications import _send_fcm, _fmt_notification
+
+    status_label = {"paid": "fully paid", "partial": "received (partial)"}.get(
+        rent_status, "received"
+    )
+    title = f"Payment {status_label} – {property_address}"
+    body  = (
+        f"Your payment of {currency} {amount:,.2f} for {period} "
+        f"has been {status_label}."
+    )
+    notif_type = "rent_payment_confirmation"
+
+    try:
+        from .socket import socketio as _socketio
+    except Exception:
+        _socketio = None
+
+    notif_doc = {
+        "userId":    tenant_oid,
+        "type":      notif_type,
+        "title":     title,
+        "body":      body,
+        "data": {
+            "rentId":     rent_id,
+            "propertyId": property_id,
+            "period":     period,
+            "amount":     str(amount),
+            "currency":   currency,
+            "status":     rent_status,
+        },
+        "read":      False,
+        "createdAt": _now(),
+    }
+    result = db.notification.insert_one(notif_doc)
+    notif_doc["_id"] = result.inserted_id
+
+    if _socketio:
+        try:
+            _socketio.emit("notification", _fmt_notification(notif_doc), to=str(tenant_oid))
+        except Exception:
+            pass
+
+    token_docs = list(db.push_token.find({"userId": tenant_oid}, {"token": 1}))
+    tokens = [t["token"] for t in token_docs if t.get("token")]
+    if tokens:
+        badge = db.notification.count_documents({"userId": tenant_oid, "read": False})
+        _send_fcm(
+            tokens, title, body,
+            {"rentId": rent_id, "propertyId": property_id, "type": notif_type},
+            badge=badge,
+        )
+
+
 def _trigger_rent_payment_notification(
     recipient_oids, tenant_name, amount, currency, period,
     property_address, rent_id, property_id, db, app
@@ -915,6 +976,20 @@ def _handle_charge_succeeded(charge, db, app):
         amount=amount_dollars,
         currency=currency,
         period=period,
+        property_address=property_doc.get("address", "your property"),
+        rent_id=str(rent_doc["_id"]),
+        property_id=str(property_oid),
+        db=db,
+        app=app,
+    )
+
+    # ── 6. Notify tenant (payment confirmation) ───────────────────────────────
+    _trigger_tenant_payment_confirmation(
+        tenant_oid=tenant_oid,
+        amount=amount_dollars,
+        currency=currency,
+        period=period,
+        rent_status=rent_doc.get("status", "paid"),
         property_address=property_doc.get("address", "your property"),
         rent_id=str(rent_doc["_id"]),
         property_id=str(property_oid),

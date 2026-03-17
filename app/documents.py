@@ -368,6 +368,49 @@ def create_document():
     return jsonify({"success": True, "data": _serialize_doc(doc, current_app.db)}), 201
 
 
+@documents_bp.route("/current-lease", methods=["GET"])
+def current_lease():
+    """
+    Return the tenant's current active lease agreement.
+
+    Looks for the most recently created document that:
+      • type  == "lease_agreement"
+      • status == "completed"
+      • signers array contains an entry with userId == caller AND status == "completed"
+
+    Only the document metadata is returned (no PDF content).
+
+    GET /api/documents/current-lease
+    """
+    user_id_str, err = decode_token(request)
+    if err:
+        return err
+
+    user_oid = _parse_oid(user_id_str)
+    db = current_app.db
+
+    lease = db.document.find_one(
+        {
+            "type":   "lease_agreement",
+            "status": "completed",
+            "signers": {
+                "$elemMatch": {
+                    "userId": user_oid,
+                    "status": "completed",
+                }
+            },
+        },
+        # Exclude the raw PDF path — data only
+        {"pdfPath": 0},
+        sort=[("createdAt", -1)],
+    )
+
+    if not lease:
+        return jsonify({"success": True, "data": None}), 200
+
+    return jsonify({"success": True, "data": _serialize_doc(lease, db)}), 200
+
+
 @documents_bp.route("/", methods=["GET"])
 def list_documents():
     """

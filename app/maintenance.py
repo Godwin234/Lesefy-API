@@ -130,19 +130,20 @@ def create_request():
     if not current_app.db.property.find_one({"_id": property_oid}):
         return jsonify({"success": False, "message": "Property not found"}), 404
 
-    doc = {
-        "propertyId": property_oid,
-        "requestedBy": ObjectId(user_id),
-        "title": title,
-        "description": description,
-        "priority": priority,
-        "status": "pending",
-        "pictures": [],
-        "assignedTo": None,
-        "notes": [],
-        "createdAt": _now(),
-        "updatedAt": _now(),
-    }
+    # Start from everything the client sent, override with server-computed fields.
+    _server_owned = {"_id", "createdAt", "updatedAt", "requestedBy", "propertyId", "pictures", "notes"}
+    doc = {k: v for k, v in (data if isinstance(data, dict) else {}).items() if k not in _server_owned}
+    doc["propertyId"]  = property_oid
+    doc["requestedBy"] = ObjectId(user_id)
+    doc["title"]       = title
+    doc["description"] = description
+    doc["priority"]    = priority
+    doc.setdefault("status",     "pending")
+    doc.setdefault("assignedTo", None)
+    doc["pictures"]  = []
+    doc["notes"]     = []
+    doc["createdAt"] = _now()
+    doc["updatedAt"] = _now()
     result = current_app.db.maintenance.insert_one(doc)
     request_id = result.inserted_id
 
@@ -310,10 +311,20 @@ def update_request(request_id):
         return jsonify({"success": False, "message": "Not authorised"}), 403
 
     data = request.get_json(silent=True) or {}
-    updates = {}
+    # Accept all fields from the client, then validate/override specific ones.
+    _IMMUTABLE   = {"_id", "createdAt", "requestedBy", "propertyId", "pictures", "notes"}
+    _LANDLORD_ONLY = {"status", "assignedTo"}
+    updates   = {}
     array_ops = {}
 
-    # Fields anyone involved can change
+    for field, val in data.items():
+        if field in _IMMUTABLE:
+            continue
+        if field in _LANDLORD_ONLY and not is_landlord:
+            continue  # silently skip landlord-only fields for non-landlords
+        updates[field] = val
+
+    # Validated overrides for fields with constrained values
     if "title" in data:
         updates["title"] = (data["title"] or "").strip()
     if "description" in data:
@@ -326,8 +337,6 @@ def update_request(request_id):
                 "message": f"priority must be one of: {', '.join(sorted(ALLOWED_PRIORITIES))}",
             }), 400
         updates["priority"] = p
-
-    # Landlord-only fields
     if is_landlord:
         if "status" in data:
             s = (data["status"] or "").strip()
@@ -338,11 +347,9 @@ def update_request(request_id):
                     "message": f"status must be one of: {', '.join(sorted(ALLOWED_STATUSES))}",
                 }), 400
             updates["status"] = s
-
         if "assignedTo" in data:
             at = (data["assignedTo"] or "").strip()
             updates["assignedTo"] = ObjectId(at) if at else None
-
         if "note" in data and data["note"]:
             array_ops["$push"] = {
                 "notes": {

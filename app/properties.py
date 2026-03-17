@@ -69,17 +69,18 @@ def create_property():
     if units is None or not isinstance(units, int) or units < 1:
         return jsonify({"success": False, "message": "units must be a positive integer"}), 400
 
-    doc = {
-        "landlordId": ObjectId(user_id),
-        "address": address,
-        "city": city,
-        "units": units,
-        "monthlyRevenue": data.get("monthlyRevenue", 0),
-        "description": (data.get("description") or "").strip(),
-        "tenants": [],
-        "createdAt": _now(),
-        "updatedAt": _now(),
-    }
+    # Start from everything the client sent, then set/override server-controlled fields.
+    _server_owned = {"_id", "createdAt", "updatedAt", "landlordId", "tenants"}
+    doc = {k: v for k, v in data.items() if k not in _server_owned}
+    doc["landlordId"]   = ObjectId(user_id)
+    doc["address"]      = address
+    doc["city"]         = city
+    doc["units"]        = units
+    doc.setdefault("monthlyRevenue", 0)
+    doc.setdefault("description", "")
+    doc["tenants"]  = []
+    doc["createdAt"] = _now()
+    doc["updatedAt"] = _now()
     result = current_app.db.property.insert_one(doc)
     doc["_id"] = result.inserted_id
 
@@ -153,11 +154,22 @@ def update_property(property_id):
         return _property_not_found()
 
     data = request.get_json(silent=True) or {}
-    allowed = {"address", "city", "units", "monthlyRevenue", "description"}
-    updates = {k: v for k, v in data.items() if k in allowed}
-
-    if "units" in updates and (not isinstance(updates["units"], int) or updates["units"] < 1):
-        return jsonify({"success": False, "message": "units must be a positive integer"}), 400
+    _IMMUTABLE = {"_id", "createdAt", "landlordId", "tenants"}
+    _NUMERIC   = {"units", "monthlyRevenue"}
+    updates = {}
+    for k, v in data.items():
+        if k in _IMMUTABLE:
+            continue
+        if k == "units":
+            if not isinstance(v, int) or v < 1:
+                return jsonify({"success": False, "message": "units must be a positive integer"}), 400
+        if k in _NUMERIC:
+            try:
+                updates[k] = type(v)(v)  # keep original numeric type
+            except (TypeError, ValueError):
+                updates[k] = v
+        else:
+            updates[k] = v
 
     if not updates:
         return jsonify({"success": False, "message": "No valid fields to update"}), 400
@@ -265,11 +277,13 @@ def add_tenant(property_id):
     if already:
         return jsonify({"success": False, "message": "User is already a tenant of this property"}), 409
 
-    tenant_entry = {
-        "tenantId": user_oid,
-        "unit": unit,
-        "rentStatus": rent_status,
-    }
+    # Build the tenant entry from everything the client sent for this tenant,
+    # then enforce server-computed fields on top.
+    _tenant_immutable = {"tenantId", "userId"}
+    tenant_entry = {k: v for k, v in data.items() if k not in _tenant_immutable}
+    tenant_entry["tenantId"] = user_oid
+    tenant_entry["unit"] = unit
+    tenant_entry["rentStatus"] = rent_status
 
     # Push into property's tenants array
     current_app.db.property.update_one(
@@ -376,9 +390,17 @@ def update_tenant(property_id, tenant_user_id):
     if not unit and not rent_status:
         return jsonify({"success": False, "message": "Provide unit and/or rentStatus to update"}), 400
 
-    # Build positional array update
+    # Build the array of updates from everything in the payload (except
+    # identity / immutable fields). Validated fields still override.
+    _immutable_tenant = {"tenantId", "userId", "_id"}
     array_updates = {}
-    user_updates = {}
+    user_updates  = {}
+    for k, v in data.items():
+        if k in _immutable_tenant:
+            continue
+        array_updates[f"tenants.$.{k}"] = v
+        user_updates[k] = v
+    # Validated overrides
     if unit:
         array_updates["tenants.$.unit"] = unit
         user_updates["unit"] = unit
@@ -386,6 +408,9 @@ def update_tenant(property_id, tenant_user_id):
         array_updates["tenants.$.rentStatus"] = rent_status
         user_updates["rentStatus"] = rent_status
     array_updates["updatedAt"] = _now()
+
+    if not array_updates:
+        return jsonify({"success": False, "message": "Provide at least one field to update"}), 400
 
     result = current_app.db.property.update_one(
         {"_id": oid, "tenants.tenantId": tenant_oid},

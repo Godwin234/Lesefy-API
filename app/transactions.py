@@ -311,25 +311,30 @@ def create_transaction():
         except ValueError:
             return jsonify({"success": False, "message": "Invalid transactionDate. Use ISO-8601."}), 400
 
+    # Start from everything the client sent, then set/override server-owned fields.
     now = _now()
-    doc = {
-        "userId":          _parse_oid(user_id_str),
-        "type":            "manual",
-        "receiptId":       None,
-        "rentId":          None,
-        "title":           title,
-        "amount":          amount,
-        "currency":        str(get("currency", "USD")).upper().strip()[:3],
-        "transactionType": txn_type,
-        "description":     get("description").strip() or None,
-        "transactionDate": txn_date,
-        "notes":           get("notes").strip() or None,
-        "propertyId":      _parse_oid(get("propertyId", "")) or None,
-        "imageUrls":       [],
-        "imagePaths":      [],
-        "createdAt":       now,
-        "updatedAt":       now,
-    }
+    _server_owned = {"_id", "createdAt", "updatedAt", "userId", "type", "receiptId", "rentId", "imageUrls", "imagePaths"}
+    if is_multipart:
+        # form-data: only well-known fields are accessible; pass them all through
+        all_form_keys = set(request.form.keys())
+        extra_fields = {k: request.form.get(k) for k in all_form_keys if k not in _server_owned}
+    else:
+        extra_fields = {k: v for k, v in _body.items() if k not in _server_owned}
+
+    doc = extra_fields
+    doc["userId"]          = _parse_oid(user_id_str)
+    doc["type"]            = "manual"
+    doc["receiptId"]       = None
+    doc["rentId"]          = None
+    doc["title"]           = title
+    doc["amount"]          = amount
+    doc["currency"]        = str(get("currency", "USD")).upper().strip()[:3]
+    doc["transactionType"] = txn_type
+    doc["transactionDate"] = txn_date
+    doc["imageUrls"]       = []
+    doc["imagePaths"]      = []
+    doc["createdAt"]       = now
+    doc["updatedAt"]       = now
 
     result = current_app.db.transaction.insert_one(doc)
     doc["_id"] = result.inserted_id

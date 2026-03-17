@@ -59,31 +59,18 @@ def _iso(dt):
 
 
 def _serialize(doc):
+    """Serialize all fields in the document, converting ObjectId and datetime values."""
     if doc is None:
         return None
-    out = {
-        "id":                    str(doc["_id"]),
-        "propertyId":            str(doc.get("propertyId", "")),
-        "tenantId":              str(doc.get("tenantId", "")),
-        "landlordId":            str(doc.get("landlordId", "")),
-        "rentDue":               doc.get("rentDue"),
-        "amount":                doc.get("amount", 0),
-        "partialPaid":           doc.get("partialPaid", 0),
-        "currency":              doc.get("currency", "USD"),
-        "period":                doc.get("period"),
-        "status":                doc.get("status", "pending"),
-        "dueDate":               _iso(doc.get("dueDate")),
-        "paidAt":                _iso(doc.get("paidAt")),
-        "description":           doc.get("description", "Rent Payment"),
-        "transactionType":       doc.get("transactionType", "credit"),
-        "paymentMethod":         doc.get("paymentMethod"),
-        "paymentMethodDetails":  doc.get("paymentMethodDetails"),
-        "stripeChargeId":        doc.get("stripeChargeId"),
-        "stripePaymentIntentId": doc.get("stripePaymentIntentId"),
-        "stripeCustomerId":      doc.get("stripeCustomerId"),
-        "createdAt":             _iso(doc.get("createdAt")),
-        "updatedAt":             _iso(doc.get("updatedAt")),
-    }
+    out = {}
+    for key, val in doc.items():
+        out_key = "id" if key == "_id" else key
+        if isinstance(val, ObjectId):
+            out[out_key] = str(val)
+        elif isinstance(val, datetime):
+            out[out_key] = val.isoformat()
+        else:
+            out[out_key] = val
     return out
 
 
@@ -96,6 +83,81 @@ def _is_landlord(user_doc):
     return (user_doc.get("userType") or user_doc.get("role") or "").lower() == "landlord"
 
 
+def _notify_tenant_rent(tenant_oid, event_type, rent_doc, property_doc, db):
+    """
+    Send an in-app notification, SocketIO event, and FCM push to the tenant
+    when a rent record is created or updated by the landlord.
+
+    event_type: "created" | "updated"
+    """
+    from .notifications import _send_fcm, _fmt_notification
+
+    try:
+        from .socket import socketio as _socketio
+    except Exception:
+        _socketio = None
+
+    address = (property_doc or {}).get("address", "your property")
+    period  = rent_doc.get("period", "")
+    due     = rent_doc.get("rentDue") or rent_doc.get("amount", 0)
+    currency = rent_doc.get("currency", "USD")
+    due_date = rent_doc.get("dueDate")
+    due_date_str = due_date.strftime("%b %d, %Y") if isinstance(due_date, datetime) else (str(due_date)[:10] if due_date else "")
+
+    if event_type == "created":
+        title = f"New rent charge – {address}"
+        body  = (
+            f"Your landlord has posted a rent charge of {currency} {due:,.2f} "
+            f"for {period}" + (f", due {due_date_str}" if due_date_str else "") + "."
+        )
+        notif_type = "rent_charge_posted"
+    else:
+        title = f"Rent record updated – {address}"
+        body  = (
+            f"Your rent record for {period} has been updated. "
+            f"Amount due: {currency} {due:,.2f}"
+            + (f" | Due: {due_date_str}" if due_date_str else "") + "."
+        )
+        notif_type = "rent_charge_updated"
+
+    rent_id     = str(rent_doc["_id"])
+    property_id = str(rent_doc.get("propertyId", ""))
+
+    notif_doc = {
+        "userId":    tenant_oid,
+        "type":      notif_type,
+        "title":     title,
+        "body":      body,
+        "data": {
+            "rentId":     rent_id,
+            "propertyId": property_id,
+            "period":     period,
+            "amount":     str(due),
+            "currency":   currency,
+        },
+        "read":      False,
+        "createdAt": _now(),
+    }
+    result = db.notification.insert_one(notif_doc)
+    notif_doc["_id"] = result.inserted_id
+
+    if _socketio:
+        try:
+            _socketio.emit("notification", _fmt_notification(notif_doc), to=str(tenant_oid))
+        except Exception:
+            pass
+
+    token_docs = list(db.push_token.find({"userId": tenant_oid}, {"token": 1}))
+    tokens = [t["token"] for t in token_docs if t.get("token")]
+    if tokens:
+        badge = db.notification.count_documents({"userId": tenant_oid, "read": False})
+        _send_fcm(
+            tokens, title, body,
+            {"rentId": rent_id, "propertyId": property_id, "type": notif_type},
+            badge=badge,
+        )
+
+
 # ── MongoDB index setup ───────────────────────────────────────────────────────
 
 def ensure_rent_indexes(db):
@@ -104,7 +166,17 @@ def ensure_rent_indexes(db):
     db.rent_payment.create_index("propertyId")
     db.rent_payment.create_index([("tenantId", 1), ("period", 1)])
     db.rent_payment.create_index("status")
-    db.rent_payment.create_index("stripeChargeId", sparse=True, unique=True)
+
+    # The stripeChargeId index must be sparse+unique so that multiple documents
+    # with stripeChargeId=null (manual rent records) are allowed.
+    # Drop the index if it already exists without the sparse flag.
+    existing = db.rent_payment.index_information()
+    idx = existing.get("stripeChargeId_1")
+    if idx and not idx.get("sparse"):
+        db.rent_payment.drop_index("stripeChargeId_1")
+    db.rent_payment.create_index(
+        "stripeChargeId", sparse=True, unique=True, name="stripeChargeId_1"
+    )
 
 
 # ── Internal helper called by stripe_finance webhook ─────────────────────────
@@ -121,11 +193,19 @@ def upsert_rent_from_charge(
     """
     from .transactions import create_transaction_for_rent
 
-    existing = db.rent_payment.find_one({
-        "tenantId": tenant_oid,
-        "period":   period,
-        "status":   {"$in": ["pending", "partial"]},
-    })
+    # Search for ANY open record for this tenant+property regardless of period.
+    # A landlord typically creates the record for next month (e.g. 2026-04)
+    # but the payment arrives in the current month (e.g. 2026-03), so
+    # restricting by the charge-date period causes a false miss and a duplicate.
+    # If multiple open records exist, pick the one with the earliest period.
+    existing = db.rent_payment.find_one(
+        {
+            "tenantId":   tenant_oid,
+            "propertyId": property_oid,
+            "status":     {"$in": ["pending", "partial"]},
+        },
+        sort=[("period", 1)],
+    )
 
     now = _now()
 
@@ -240,19 +320,29 @@ def create_rent():
 
     data = request.get_json(silent=True) or {}
 
-    tenant_id_raw  = (data.get("tenantId") or "").strip()
+    tenant_id_raw   = (data.get("tenantId") or "").strip()
     property_id_raw = (data.get("propertyId") or "").strip()
-    rent_due       = data.get("rentDue")
-    period         = (data.get("period") or "").strip()
+    # Accept rentDue, or fall back to amount or mainRent so callers don't have
+    # to rename their fields.
+    rent_due_raw = (
+        data.get("rentDue")
+        if data.get("rentDue") is not None
+        else (
+            data.get("amount")
+            if data.get("amount") is not None
+            else data.get("mainRent")
+        )
+    )
+    period = (data.get("period") or "").strip()
 
     if not tenant_id_raw:
         return jsonify({"success": False, "message": "tenantId is required"}), 400
     if not property_id_raw:
         return jsonify({"success": False, "message": "propertyId is required"}), 400
-    if rent_due is None:
-        return jsonify({"success": False, "message": "rentDue is required"}), 400
+    if rent_due_raw is None:
+        return jsonify({"success": False, "message": "rentDue (or amount) is required"}), 400
     try:
-        rent_due = float(rent_due)
+        rent_due = float(rent_due_raw)
     except (TypeError, ValueError):
         return jsonify({"success": False, "message": "rentDue must be a number"}), 400
     if not period:
@@ -287,30 +377,53 @@ def create_rent():
         except ValueError:
             return jsonify({"success": False, "message": "Invalid dueDate format, use ISO-8601"}), 400
 
-    rent_doc = {
-        "propertyId":      property_oid,
-        "tenantId":        tenant_oid,
-        "landlordId":      landlord_oid,
-        "rentDue":         rent_due,
-        "amount":          0,
-        "partialPaid":     0,
-        "currency":        (data.get("currency") or "USD").upper().strip(),
-        "period":          period,
-        "status":          "pending",
-        "dueDate":         due_date,
-        "paidAt":          None,
-        "description":     (data.get("description") or "Rent Payment").strip(),
-        "transactionType": "credit",
-        "paymentMethod":   None,
-        "paymentMethodDetails": None,
-        "stripeChargeId":        None,
-        "stripePaymentIntentId": None,
-        "stripeCustomerId":      None,
-        "createdAt":       _now(),
-        "updatedAt":       _now(),
-    }
+    # Start with everything the client sent, then set/override server-controlled fields.
+    # _id, createdAt, updatedAt, landlordId are always server-owned.
+    _server_owned = {"_id", "createdAt", "updatedAt", "landlordId"}
+    rent_doc = {k: v for k, v in data.items() if k not in _server_owned}
+
+    # Required / computed overrides
+    rent_doc["propertyId"]  = property_oid
+    rent_doc["tenantId"]    = tenant_oid
+    rent_doc["landlordId"]  = landlord_oid
+    rent_doc["rentDue"]     = rent_due
+    rent_doc["currency"]    = (data.get("currency") or "USD").upper().strip()
+    rent_doc["period"]      = period
+    rent_doc["dueDate"]     = due_date
+
+    # Apply defaults only when the client did not supply a value
+    rent_doc.setdefault("amount",          0)
+    rent_doc.setdefault("partialPaid",     0)
+    rent_doc.setdefault("status",          "pending")
+    rent_doc.setdefault("description",     "Rent Payment")
+    rent_doc.setdefault("transactionType", "credit")
+
+    # Guard: ensure status is valid even if client sent something unexpected
+    if rent_doc.get("status") not in VALID_STATUSES:
+        rent_doc["status"] = "pending"
+
+    # Remove Stripe / payment fields if they are None / falsy so that the
+    # sparse unique index on stripeChargeId is not violated by null values.
+    # MongoDB sparse indexes still index documents where the field is
+    # explicitly null — only *absent* fields are excluded from the index.
+    for _stripe_field in (
+        "stripeChargeId", "stripePaymentIntentId", "stripeCustomerId",
+        "paymentMethod", "paymentMethodDetails", "paidAt",
+    ):
+        if not rent_doc.get(_stripe_field):
+            rent_doc.pop(_stripe_field, None)
+
+    rent_doc["createdAt"] = _now()
+    rent_doc["updatedAt"] = _now()
     result = db.rent_payment.insert_one(rent_doc)
     rent_doc["_id"] = result.inserted_id
+
+    # Notify the tenant that a rent charge has been posted
+    try:
+        prop = db.property.find_one({"_id": property_oid})
+        _notify_tenant_rent(tenant_oid, "created", rent_doc, prop, db)
+    except Exception:
+        pass
 
     return jsonify({
         "success": True,
@@ -463,44 +576,44 @@ def update_rent(rent_id):
     if not data:
         return jsonify({"success": False, "message": "No fields provided"}), 400
 
-    EDITABLE = {
-        "rentDue", "amount", "partialPaid", "currency", "period",
-        "status", "description", "paymentMethod",
-    }
+    # Accept all incoming fields except immutable identity / audit fields.
+    IMMUTABLE = {"_id", "createdAt", "tenantId", "landlordId", "propertyId"}
+    NUMERIC   = {"rentDue", "amount", "partialPaid"}
+    DATETIME  = {"dueDate", "paidAt"}
+
     updates = {}
 
-    for field in EDITABLE:
-        if field in data:
-            if field == "status" and data[field] not in VALID_STATUSES:
+    for field, val in data.items():
+        if field in IMMUTABLE:
+            continue
+        if field == "status":
+            if val not in VALID_STATUSES:
                 return jsonify({
                     "success": False,
                     "message": f"status must be one of: {', '.join(sorted(VALID_STATUSES))}",
                 }), 400
-            if field in {"rentDue", "amount", "partialPaid"}:
-                try:
-                    updates[field] = float(data[field])
-                except (TypeError, ValueError):
-                    return jsonify({"success": False, "message": f"{field} must be a number"}), 400
-            else:
-                updates[field] = data[field]
-
-    # DateTime fields
-    for dt_field in ("dueDate", "paidAt"):
-        if dt_field in data:
-            raw = (data[dt_field] or "").strip()
-            if not raw:
-                updates[dt_field] = None
+            updates[field] = val
+        elif field in NUMERIC:
+            try:
+                updates[field] = float(val)
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "message": f"{field} must be a number"}), 400
+        elif field in DATETIME:
+            if not val:
+                updates[field] = None
             else:
                 try:
-                    updates[dt_field] = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+                    updates[field] = datetime.fromisoformat(str(val).replace("Z", "+00:00"))
                 except ValueError:
                     return jsonify({
                         "success": False,
-                        "message": f"Invalid {dt_field} format, use ISO-8601",
+                        "message": f"Invalid {field} format, use ISO-8601",
                     }), 400
+        else:
+            updates[field] = val
 
     if not updates:
-        return jsonify({"success": False, "message": "No valid fields to update"}), 400
+        return jsonify({"success": False, "message": "No fields provided to update"}), 400
 
     updates["updatedAt"] = _now()
     db.rent_payment.update_one({"_id": oid}, {"$set": updates})
@@ -521,6 +634,16 @@ def update_rent(rent_id):
             )
 
     updated = db.rent_payment.find_one({"_id": oid})
+
+    # Notify the tenant that their rent record was updated
+    try:
+        tenant_oid_notif = doc.get("tenantId")
+        prop_notif = db.property.find_one({"_id": doc.get("propertyId")})
+        if tenant_oid_notif:
+            _notify_tenant_rent(tenant_oid_notif, "updated", updated, prop_notif, db)
+    except Exception:
+        pass
+
     return jsonify({
         "success": True,
         "message": "Rent record updated",
