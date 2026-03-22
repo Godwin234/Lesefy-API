@@ -888,6 +888,12 @@ def sign_document(doc_id):
                 app,
             )
 
+    from .activities import _log_activity
+    _log_activity(db, user_oid,
+                  "DOCUMENT_COMPLETED" if new_status == "completed" else "DOCUMENT_SIGNED",
+                  {"documentId": doc_id, "title": doc.get("title"),
+                   "documentStatus": new_status})
+
     updated_doc = db.document.find_one({"_id": doc_oid}, {"pdfPath": 0, "signedPdfPath": 0})
     return jsonify({"success": True, "data": _serialize_doc(updated_doc)}), 200
 

@@ -286,6 +286,13 @@ def upsert_rent_from_charge(
         {"$set": {"rentStatus": status_display}},
     )
 
+    from .activities import _log_activity
+    _log_activity(db, landlord_oid, "RENT_PAYMENT_RECEIVED",
+                  {"rentId": str(rent_doc["_id"]), "period": rent_doc.get("period"),
+                   "amount": amount_paid, "currency": currency,
+                   "status": rent_doc.get("status"),
+                   "tenantId": str(tenant_oid), "propertyId": str(property_oid)})
+
     return rent_doc
 
 
@@ -417,6 +424,12 @@ def create_rent():
     rent_doc["updatedAt"] = _now()
     result = db.rent_payment.insert_one(rent_doc)
     rent_doc["_id"] = result.inserted_id
+
+    from .activities import _log_activity
+    _log_activity(db, landlord_oid, "RENT_RECORD_CREATED",
+                  {"rentId": str(rent_doc["_id"]), "period": period,
+                   "rentDue": rent_due, "tenantId": str(tenant_oid),
+                   "propertyId": str(property_oid)})
 
     # Notify the tenant that a rent charge has been posted
     try:
@@ -634,6 +647,10 @@ def update_rent(rent_id):
             )
 
     updated = db.rent_payment.find_one({"_id": oid})
+
+    from .activities import _log_activity
+    _log_activity(db, caller["_id"], "RENT_RECORD_UPDATED",
+                  {"rentId": str(oid), "changes": list(updates.keys())})
 
     # Notify the tenant that their rent record was updated
     try:

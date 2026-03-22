@@ -340,6 +340,11 @@ def create_transaction():
     doc["_id"] = result.inserted_id
     txn_id_str = str(result.inserted_id)
 
+    from .activities import _log_activity
+    _log_activity(current_app.db, _parse_oid(user_id_str), "TRANSACTION_CREATED",
+                  {"transactionId": txn_id_str, "type": txn_type,
+                   "amount": amount, "title": title})
+
     # Handle optional images attached at creation time
     if is_multipart:
         files = request.files.getlist("images")

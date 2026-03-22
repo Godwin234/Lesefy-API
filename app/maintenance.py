@@ -158,6 +158,12 @@ def create_request():
         doc["pictures"] = saved_files
 
     doc["_id"] = request_id
+
+    from .activities import _log_activity
+    _log_activity(current_app.db, ObjectId(user_id), "MAINTENANCE_REQUEST_CREATED",
+                  {"requestId": str(request_id), "title": title, "priority": priority,
+                   "propertyId": str(property_oid)})
+
     return jsonify({
         "success": True,
         "message": "Maintenance request created",
@@ -369,6 +375,12 @@ def update_request(request_id):
 
     current_app.db.maintenance.update_one({"_id": oid}, mongo_update)
     req = current_app.db.maintenance.find_one({"_id": oid})
+
+    from .activities import _log_activity
+    _log_activity(current_app.db, ObjectId(user_id), "MAINTENANCE_REQUEST_UPDATED",
+                  {"requestId": str(oid), "changes": list(updates.keys()),
+                   "newStatus": updates.get("status")})
+
     return jsonify({"success": True, "message": "Request updated", "data": _serialize(req)}), 200
 
 

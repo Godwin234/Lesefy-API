@@ -35,6 +35,31 @@ def _serialize(doc):
     return doc
 
 
+# ── Shared backend helper ─────────────────────────────────────────────────────
+
+def _log_activity(db, user_oid, activity_type, metadata=None):
+    """
+    Persist an activity record from anywhere in the backend.
+    Silently swallows errors so it never breaks the caller.
+
+    Parameters
+    ----------
+    db            : pymongo database object
+    user_oid      : ObjectId of the user performing the action
+    activity_type : str  e.g. "LOGIN", "RENT_PAYMENT_RECEIVED"
+    metadata      : dict  optional extra data stored under "metadata" key
+    """
+    try:
+        db.activity.insert_one({
+            "userId":    user_oid,
+            "type":      activity_type,
+            "metadata":  metadata or {},
+            "createdAt": _now(),
+        })
+    except Exception:
+        pass
+
+
 # ── Save activity ─────────────────────────────────────────────────────────────
 
 @activities_bp.route("", methods=["POST"])

@@ -540,7 +540,10 @@ def upload_receipt():
     receipt_doc["_id"]      = result.inserted_id
     receipt_doc["imageUrl"] = img_url
 
-    # Auto-create a linked transaction
+    from .activities import _log_activity
+    _log_activity(current_app.db, user_oid, "RECEIPT_UPLOADED",
+                  {"receiptId": doc_id, "totalAmount": extracted.get("totalAmount"),
+                   "currency": extracted.get("currency"), "storeName": extracted.get("storeName")})
     try:
         from .transactions import create_transaction_for_receipt
         create_transaction_for_receipt(receipt_doc, current_app.db)

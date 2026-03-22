@@ -84,6 +84,10 @@ def create_property():
     result = current_app.db.property.insert_one(doc)
     doc["_id"] = result.inserted_id
 
+    from .activities import _log_activity
+    _log_activity(current_app.db, ObjectId(user_id), "PROPERTY_CREATED",
+                  {"propertyId": str(doc["_id"]), "address": address})
+
     return jsonify({
         "success": True,
         "message": "Property created successfully",
@@ -216,6 +220,11 @@ def delete_property(property_id):
         )
 
     current_app.db.property.delete_one({"_id": oid})
+
+    from .activities import _log_activity
+    _log_activity(current_app.db, ObjectId(user_id), "PROPERTY_DELETED",
+                  {"propertyId": str(oid)})
+
     return jsonify({"success": True, "message": "Property deleted"}), 200
 
 
@@ -306,6 +315,11 @@ def add_tenant(property_id):
     )
 
     tenant_entry["tenantId"] = str(tenant_entry["tenantId"])
+
+    from .activities import _log_activity
+    _log_activity(current_app.db, ObjectId(landlord_id), "TENANT_ASSIGNED",
+                  {"propertyId": str(oid), "tenantId": user_id_raw, "unit": unit})
+
     return jsonify({
         "success": True,
         "message": "Tenant added successfully",
@@ -465,5 +479,9 @@ def remove_tenant(property_id, tenant_user_id):
         {"_id": tenant_oid},
         {"$unset": {"propertyId": "", "unit": "", "rentStatus": "", "role": ""}},
     )
+
+    from .activities import _log_activity
+    _log_activity(current_app.db, ObjectId(landlord_id), "TENANT_REMOVED",
+                  {"propertyId": str(oid), "tenantId": str(tenant_oid)})
 
     return jsonify({"success": True, "message": "Tenant removed from property"}), 200

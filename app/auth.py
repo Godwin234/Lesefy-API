@@ -98,6 +98,9 @@ def register():
             "password_hash": generate_password_hash(password),
         })
 
+    from .activities import _log_activity
+    _log_activity(db, user_id, "USER_REGISTERED", {"email": email})
+
     return jsonify({
         "success": True,
         "message": "User created successfully",
@@ -185,6 +188,9 @@ def login():
         "exp": datetime.now(timezone.utc) + timedelta(days=7),
     }
     token = jwt.encode(payload, current_app.config["SECRET_KEY"], algorithm="HS256")
+
+    from .activities import _log_activity
+    _log_activity(db, user["_id"], "LOGIN", {"email": email})
 
     return jsonify({
         "user": user_data,
